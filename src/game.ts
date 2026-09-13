@@ -6,14 +6,15 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { W, H, DPR } from './engine/view';
-import { gl, mesh, frame, draw as drawMesh, setBands, setDark, setBlend, setSky, setFade, type Mesh } from './engine/gl';
+import { xr, xrOK, xrCheck, enterVR } from './engine/xr';
+import { gl, mesh, clear, setVP, setText, text, draw as drawMesh, setBands, setGrey, setBlend, setSky, setFade, type Mesh } from './engine/gl';
 import { mat, perspective, view, multiply, place, partAt, type M4 } from './engine/mat';
 import { cam, player, bounds, stick, update as moveRig, follow } from './engine/camera';
 import { sfx, toggleMute, isMuted } from './engine/audio';
 import { pressed, pointer } from './engine/input';
 import { ROT } from './engine/view';
 import { puff, dome, panel, ring, mark, arc, prismSolid, join, shift, keyShape, note } from './mesh';
-import { buildParts, PALETTE, SCALE, LEGS, HOOVES, HORN } from './unicorn';
+import { PARTS as uParts, PALETTE, SCALE, LEGS, HOOVES, HORN } from './unicorn';
 import * as Hunter from './hunter';
 import {
   load, LEVELS, gems, spawn, exit, roofs, par, limit, brief, at, wx, wz, ti, tj, solidBox, COLS, ROWS, TILE,
@@ -55,6 +56,13 @@ const tmpM = mat();
 
 const overlay = mesh(panel(TILE, TILE));
 const cloudMesh = mesh(puff(1.1));
+/** The page's text, for the headset: one panel, one texture, redrawn when the words change. */
+const textMesh = mesh(panel(1, 0.625));
+const tc = document.createElement('canvas');
+tc.width = 1024;
+tc.height = 640;
+const tx = tc.getContext('2d')!;
+let hudKey = '';
 const gasMesh = mesh(puff(0.36));
 const ringMesh = mesh(ring(0.93, 1));
 /** A disc: a ring with no hole. Half its triangles are empty, which the GPU does not mind. */
@@ -75,7 +83,6 @@ const arcMeshes = Array.from({ length: 7 }, (_, i) => mesh(arc(17 + i * 1.15, 18
 /** The goal: a diamond, the stage mark hovering over the exit the way people remember it. */
 const goalMesh = mesh(join(shift(prismSolid(1, 1, 0.02, 0.02, 0.8), 0, 0.8, 0), prismSolid(0.02, 0.02, 1, 1, 0.8)));
 
-const uParts = buildParts();
 const uMesh = uParts.map((p) => mesh(p.geo));
 const hMesh = Hunter.parts.map((p) => mesh(p.geo));
 
@@ -90,7 +97,7 @@ ui.style.cssText =
 ui.innerHTML =
   // The bar's negative margin keeps its text on the column with the lines above and below;
   // the cursor sits outside the bar, in the margin, so the column never shifts under it.
-  '<style>.b{background:#ff3fb0;color:#2a0730;padding:0 .6em;margin:0 -.6em;position:relative}' +
+  '<style>*{margin:0;padding:0}html,body{height:100%;overflow:hidden;touch-action:none;user-select:none;-webkit-user-select:none}canvas{display:block;width:100%;height:100%}.v{transform:rotate(90deg) translateY(-100%);transform-origin:0 0;width:100vh;height:100vw;width:100dvh;height:100dvw}.b{background:#ff3fb0;color:#2a0730;padding:0 .6em;margin:0 -.6em;position:relative}' +
   '.c:before{content:"▶";position:absolute;right:100%;margin-right:.5em}' +
   // A dark backing behind the border, so a boxed line stays readable over a pink floor
   // or a white cloud instead of dissolving into whatever the camera happens to be over.
@@ -125,11 +132,19 @@ const knob = pad.firstChild as HTMLElement;
 const fart = document.createElement('b');
 fart.className = 'z';
 fart.textContent = '\u{1F4A8}';
+/** Shown when a headset can be entered from this page; a click is the gesture a session needs. */
+const vrBtn = document.createElement('b');
+vrBtn.className = 'x';
+vrBtn.textContent = 'ENTER VR';
+vrBtn.hidden = true;
+vrBtn.style.cssText = 'position:fixed;top:18px;left:50%;translate:-50%';
+vrBtn.onclick = enterVR;
+vrBtn.onpointerdown = (e) => e.stopPropagation(); // not a confirmation
 top.style.cssText = 'text-align:left;white-space:pre;opacity:.9';
 mid.style.cssText = 'font-size:34px;letter-spacing:.24em;white-space:pre;line-height:1.35';
 low.style.cssText = 'opacity:.8;white-space:pre';
 pct.style.cssText = 'position:absolute;top:18px;right:22px';
-ui.append(top, mid, low, pct, pad, fart);
+ui.append(top, mid, low, pct, pad, fart, vrBtn);
 document.body.appendChild(ui);
 // Single presses from any box (data-p): the big button, the mission box, the sound box,
 // the clock, EXIT. Fingers and pens only — the mouse plays no part in this game.
@@ -162,7 +177,7 @@ pad.addEventListener('pointermove', (e) => {
   knob.style.transform = 'translate(' + dx + 'px,' + dy + 'px)';
   stick.x = m > 0.25 ? dx / 45 : 0;
   stick.y = m > 0.25 ? dy / 45 : 0;
-  if (Math.abs(dy) > 25) sk.fy = dy;
+  sk.fy = Math.abs(dy) > 25 ? dy : 0;
 });
 pad.onpointerup = pad.onpointercancel = (e) => {
   if (e.pointerId !== sk.id) return;
@@ -177,7 +192,7 @@ ui.addEventListener('touchstart', () => {});
 /** Writes only on change: rewriting the same HTML every frame would restart its animations. */
 const set = (el: HTMLElement, s: string) => { if (el.dataset.h !== s) el.innerHTML = el.dataset.h = s; };
 /** One line of a screen that builds itself up: the i-th fades in after the others. */
-const line = (s: string, i: number) => '<div class=f style="animation-delay:' + i * 0.6 + 's">' + s + '</div>';
+const line = (s: string) => '<div class=f>' + s + '</div>';
 
 /** A touchscreen, most likely: a first guess from the media query, settled by the first
  *  pointer that actually arrives — the hints and the pad change, the rules do not. */
@@ -191,7 +206,7 @@ addEventListener('keydown', () => { COARSE = false; });
 // --- touch: a finger on the floor confirms, outside a mission; the buttons do the rest ---
 function touch() {
   if (pointer.up && phase !== 'play') pressed.add('Space');
-  pointer.hit = pointer.up = false; // consumed by this step, not by the next one too
+  pointer.up = false; // consumed by this step, not by the next one too
 }
 
 const two = (n: number) => (n < 10 ? '0' : '') + n;
@@ -248,10 +263,6 @@ let downT = -1;
 let stride = 0;
 let gait = 0;
 
-const drain = (r: number, g: number, b: number, k: number): [number, number, number] => {
-  const l = r * 0.3 + g * 0.59 + b * 0.11;
-  return [r + (l - r) * k, g + (l - g) * k, b + (l - b) * k];
-};
 
 const hsv = (h: number, s: number, v: number): [number, number, number] => {
   const f = (n: number) => {
@@ -282,16 +293,14 @@ function reset(caught: boolean) {
   opened = !gems.length;
   // Every attempt at a level plays out the same way — a patrol you can learn is the
   // whole point of a patrol — so the colours taken this attempt go back on the floor.
-  for (const g of gems) if (g.taken) { g.taken = false; bands--; }
+  for (const g of gems) if (g.taken && phase !== 'won') { g.taken = false; bands--; }
   gasCool = 0;
   caughtT = 0;
   stride = gait = player.speed = 0;
   Hunter.reset();
   Hunter.look(); // the gaze is on the floor while the brief is up, not only once play starts
-  if (caught) {
-    grey = Math.min(1, grey + FADE);
-    sfx([1.1, , 90, 0.1, 0.4, 0.8, 4, 0.5, -3, , , , , 1.5, , 0.4, 0.2]);
-  }
+  // Caught: a little colour leaves the world for good. The sting already said it out loud.
+  if (caught) grey = Math.min(1, grey + FADE);
   follow(0, true); // no glide back to the start: cut straight there
 }
 
@@ -365,21 +374,22 @@ function hud() {
   if (ui.dataset.g !== String(grey)) ui.style.filter = 'saturate(' + (1 - (ui.dataset.g = String(grey), grey)) + ')';
   const n = two(level + 1);
   const p = cleared();
+  const start = xr.session ? 'PULL THE TRIGGER' : COARSE ? 'PRESS TO START' : 'PRESS SPACE TO START';
+  const kb = !COARSE && !xr.session; // the key hints are for a keyboard, not a thumb or a hand
   set(pct, phase === 'boot' ? '' : '<span class=x data-p=KeyM>' + (isMuted() ? '\u{1F507}' : '\u{1F50A}') + '</span>');
   // The two-line box of every VR mission; TIME turns red and pulses in the last ten seconds.
   const box =
     '<div class="x t" data-p=' + (fails > 2 ? 'Enter' : 'KeyR') + '><span style="opacity:.6">' + (fails > 2 ? '\u23ED' : '\u21BB') + '  LIMIT  ' + fmt(limit) +
     '</span>\n<span class="' + (limit - clock < 10 && (t * 4) % 1 < 0.5 ? 'r' : '') + '">   TIME   ' + fmt(clock) + '</span></div>';
-  const inPlay = phase === 'play' && !(caughtT > 0 && caughtT < 0.9);
   set(top, phase === 'boot' || phase === 'title' || phase === 'menu' || phase === 'end' ? ''
     : '<span class=x data-p=Escape>\u2630  MISSION ' + n + '</span>' +
-      (phase === 'play' ? (level < 2 && !COARSE ? '\nSPACE · FART   ESC · MENU' : '') + (fails > 2 ? (COARSE ? '\nTHE CLOCK · SKIP' : '\nENTER · SKIP') : '') : '') +
-      (COARSE && inPlay ? '\n' + box : ''));
+      (phase === 'play' && fails > 2 && kb ? '\nENTER · SKIP' : ''));
   // The big button says what it does on this screen; the pad only shows where it serves.
   const label = phase === 'title' || phase === 'menu' ? 'START' : phase === 'won' ? 'NEXT' : phase === 'end' ? (phaseT > 3 ? 'AGAIN' : '') : '\u{1F4A8}';
   set(fart, label);
   fart.style.fontSize = label.length > 2 ? '20px' : '';
   fart.hidden = !COARSE || phase === 'boot';
+  vrBtn.hidden = !xrOK || !!xr.session || phase === 'boot';
   pad.hidden = !COARSE || !(phase === 'menu' || phase === 'intro' || phase === 'play');
   // The pink of the press drains out of the button until the next fart is ready.
   if (COARSE) {
@@ -389,71 +399,94 @@ function hud() {
   mid.classList.toggle('u', phase === 'title');
   let m = '';
   let l = '';
-  const start = COARSE ? 'PRESS TO START' : 'PRESS SPACE TO START';
 
   if (phase === 'boot') {
     // The machine boots the way the original's did: a log, one line at a time.
     m =
-      '<div class="s t x">' + line('UNICORN VR SYSTEM', 0) + line('LOADING PLATFORM ....... OK', 1) +
-      line('CALIBRATING HORN ....... OK', 2) + line('PAINTING SKY ........... OK', 3) +
-      line('HUNTERS ON THEIR ROUNDS  OK', 4) + '</div>';
+      '<div class="s t x">' + line('UNICORN VR SYSTEM') + line('LOADING PLATFORM ....... OK') + '</div>';
     l = '<span class=p>' + start + '</span>'; // the log can be skipped, and says so
   } else if (phase === 'title') {
     m =
-      '<div class=f><div class=q>TACTICAL FLATULENCE ACTION</div><span class=w>' + NAME + '<br>MISSIONS</span>' +
+      '<div><div class=q>TACTICAL FLATULENCE ACTION</div><span class=w>' + NAME + '<br>MISSIONS</span>' +
       '<div class=q>NO ONE TAKES A UNICORN BY FORCE.<br>ONLY BY PATIENCE AND TRICKERY.</div></div>';
     // The prompt sits at the bottom, on the sky, not on the tiles; the pad speaks for itself.
-    l = '<div class="r p" style="font-size:26px;letter-spacing:.3em">' + start + '</div>' + (COARSE ? '' : '\nARROWS / WASD · MOVE      SPACE · FART      M · MUTE');
+    l = '<div class="r p" style="font-size:26px;letter-spacing:.3em">' + start + '</div>' + (kb ? '\nARROWS / WASD · MOVE      SPACE · FART      M · MUTE' : '');
   } else if (phase === 'menu') {
     // The original's list: vertical, looping, cursor held at the centre, a full bar on
     // the current line, [EXIT] at the bottom whether or not it has anything to do.
     // A cleared mission carries its best time on its own line; a locked one is dimmed.
-    m = '<div class=s>SNEAKING MODE · NO HORN<br><br><div class=t>';
+    m = '<div class=s>SNEAKING MODE<br><br><div class=t>';
     for (let k = -2; k <= 2; k++) {
       const i = (cursor + k + N) % N;
       const b = best(i);
       m += '<div class="' + (k ? '' : 'b c ') + (i > p ? 'd' : '') + '">MISSION ' + two(i + 1) + (b ? '   ' + fmt(b) : '') + '</div>';
     }
     m += '<br><span class=x data-p=Escape>EXIT</span></div></div>';
-    l = (cursor <= p ? 'TARGET ' + fmt(LEVELS[cursor].par) : 'LOCKED') + (COARSE ? '' : '\n\nUP / DOWN · CHOOSE      SPACE · START      ESC · EXIT');
+    l = (cursor <= p ? 'TARGET ' + fmt(LEVELS[cursor].par) : 'LOCKED') + (kb ? '\n\nSPACE · START      ESC · EXIT' : '');
   } else if (phase === 'intro') {
     m = phaseT > 0.5
-      ? line('MISSION ' + n + '<div class=s><br>' + brief + (gems.length ? '<br>TAKE THE KEY. THE GOAL WILL OPEN' : '') + '</div>', 0)
-      : line('START', 0);
-    l = 'TARGET ' + fmt(par) + '      LIMIT ' + fmt(limit) + (COARSE ? '' : '      ESC · MENU');
+      ? line('MISSION ' + n + '<div class=s><br>' + brief + (gems.length ? '<br>TAKE THE KEY FIRST' : '') + '</div>')
+      : line('START');
+    l = 'TARGET ' + fmt(par) + '      LIMIT ' + fmt(limit);
   } else if (phase === 'play') {
     m = caughtT > 0 ? '<span class="o k">' + (timeUp ? 'TIME UP<br>' : '') + 'MISSION FAILED</span>' : '';
-    l = caughtT > 0 && caughtT < 0.9 ? 'TRY AGAIN' : COARSE ? '' : box;
+    l = caughtT > 0 && caughtT < 0.9 ? 'TRY AGAIN' : box; // bottom centre, off the platform's corner
   } else if (phase === 'won') {
     // The original's table of three times, filled in by the machine before you ran.
     m =
-      line('MISSION ' + n + ' CLEARED', 0) + '<div class="s t x">' +
+      line('MISSION ' + n + ' CLEARED') + '<div class="s t x">' +
       line('1ST    ' + fmt(par) + '<br>2ND    ' + fmt(par * 1.5) + '<br>3RD    ' + fmt(limit) + '<br><span class="' +
-        (clock <= par ? 'b' : '') + '">TIME   ' + fmt(clock) + '</span><br>BEST   ' + fmt(best(level)), 0.5) + '</div>';
+        (clock <= par ? 'b' : '') + '">TIME   ' + fmt(clock) + '</span>') + '</div>';
     l = level + 1 < N ? 'NEXT STAGE...' : '';
   } else if (phase === 'end') {
     m =
       phaseT < 2
         ? ''
-        : line('ALL MISSIONS COMPLETE', 0) + '<div class="s t x">' + line('TOTAL         ' + fmt(runT), 1) +
-          line('COLOUR KEPT   ' + Math.round((1 - grey) * 100) + ' %', 2) +
+        : line('ALL MISSIONS COMPLETE') + '<div class="s t x">' + line('TOTAL         ' + fmt(runT)) +
+          line('COLOUR KEPT   ' + Math.round((1 - grey) * 100) + ' %') +
           '</div>' +
           line('<div class=s><br>' +
             (!grey ? 'PERFECT RUN · NO ONE EVER SAW YOU' : grey === 1 ? 'THE COLOUR IS GONE.<br>LIFE IS NOT A FAIRY TALE.' : '') +
-            '</div>', 3);
-    l = phaseT > 3 && !COARSE ? 'SPACE · AGAIN' : '';
+            '</div>');
+    l = phaseT > 3 ? (kb ? 'SPACE · AGAIN' : xr.session ? 'PULL THE TRIGGER' : '') : '';
   }
   set(mid, m);
   set(low, l);
 }
 
+/** Buttons and stick flicks held down since the last step, so that a press is one press. */
+const held = new Set<string>();
+function pads() {
+  let sx = 0, sy = 0;
+  const on = [0, 0, 0, 0, 0, 0];
+  for (const src of xr.session.inputSources) {
+    const g = src.gamepad;
+    if (!g) continue;
+    sx += g.axes[2] || 0;
+    sy += g.axes[3] || 0;
+    g.buttons.forEach((b: any, i: number) => { if (b.pressed) on[i] = 1; });
+  }
+  // Both hands are one pad: trigger, A or X, B or Y.
+  [[0, 'Space'], [4, 'Escape'], [5, fails > 2 ? 'Enter' : 'KeyR']].forEach(([i, k]) => {
+    if (on[i as number]) { if (!held.has(k as string)) pressed.add(k as string); held.add(k as string); } else held.delete(k as string);
+  });
+  stick.x = Math.abs(sx) > 0.25 ? sx : 0;
+  stick.y = Math.abs(sy) > 0.25 ? sy : 0;
+  // A flick of the stick up or down steps through the mission list, like on a phone.
+  const fl = sy > 0.6 ? 'ArrowDown' : sy < -0.6 ? 'ArrowUp' : '';
+  if (fl && !held.has('f')) pressed.add(fl);
+  fl ? held.add('f') : held.delete('f');
+}
+
 export function update(dt: number) {
+  if (xr.session) pads();
   t += dt;
   touch();
   // Puffs age in every phase: what is in the air keeps rising through the "!" hold and
   // over the cleared-mission table, when the rest of the world stands still.
   gas = gas.filter((g) => (g.age += dt) < g.life);
   flash -= dt * 3;
+  gasCool -= dt;
   if (pressed.has('KeyM') || pressed.has('Semicolon')) toggleMute();
   const go = pressed.has('Space') || pressed.has('Enter');
 
@@ -465,7 +498,7 @@ export function update(dt: number) {
   if (downT >= 0 && (downT += dt) > 1.7) { downT = -1; bootT = 0; }
 
   if (phase === 'boot') {
-    if (bootT > 3.6 || go) phase = 'title';
+    if (bootT > 2.4 || go) { phase = 'title'; xrCheck(); }
   } else if (phase === 'title') {
     if (go) { phase = 'menu'; preview(Math.min(cleared(), N - 1)); }
   } else if (phase === 'menu') {
@@ -483,8 +516,9 @@ export function update(dt: number) {
     follow(dt);
     if (go && phaseT > 3) { restart(); phase = 'title'; }
   } else if (pressed.has('Escape')) {
-    // Out of a mission and back to the list, whatever the mission was doing.
-    reset(false);
+    // Out of a mission and back to the list, whatever the mission was doing — a sighting
+    // still being shown is still paid for.
+    reset(caughtT > 0 && !timeUp);
     cursor = level;
     phase = 'menu';
     downT = 0;
@@ -526,13 +560,12 @@ function play(dt: number) {
 
   // Space: the unicorn farts. Snake knocked on walls; this is the same trick, and the
   // noise carries through walls the way sound does. Any hunter in earshot comes to look.
-  gasCool -= dt;
   if (pressed.has('Space') && gasCool <= 0) {
     gasCool = 3; // one trick at a time: a lure is a decision, not a machine gun
     const fx = Math.sin(player.yaw), fz = -Math.cos(player.yaw);
     burst(player.x - fx * 1.3, player.z - fz * 1.3, 1.1);
     // A low sawtooth that sags in pitch, retriggered fast with a tremolo: the brrr.
-    sfx([1.6, 0.15, 88, 0.01, 0.2, 0.22, 1, 1.8, -5, , , , 0.05, 0.25, 9, , , 0.7, 0.03, 0.35]);
+    sfx([1.8, 0.45, 48, 0.005, 0.55, 0.12, 3, 1.4, -25, , , , 0.03, 0.7, 6, , , 0.85, 0.01, 0.5]); // tuned by ear by Paul, 12/09
     noise(Hunter.HEARING);
   }
   if (ringAge >= 0 && (ringAge += dt) > 0.7) ringAge = -1;
@@ -543,8 +576,8 @@ function play(dt: number) {
 
   // Slide along edges: resolve each axis on its own so a corner does not stop you dead.
   // There is no outer wall — what stops you is the platform simply ending.
-  if (solidBox(player.x, wasZ, 0, BODY, BODY)) player.x = wasX;
-  if (solidBox(player.x, player.z, 0, BODY, BODY)) player.z = wasZ;
+  if (solidBox(player.x, wasZ, BODY)) player.x = wasX;
+  if (solidBox(player.x, player.z, BODY)) player.z = wasZ;
 
   // The muzzle and the rump against walls: pushed out along the body's axis, never refused.
   const fx = Math.sin(player.yaw), fz = -Math.cos(player.yaw);
@@ -553,10 +586,10 @@ function play(dt: number) {
   const px = player.x, pz = player.z;
   for (let k = 0; k < 6 && nose(); k++) { player.x -= fx * 0.1; player.z -= fz * 0.1; }
   for (let k = 0; k < 6 && tail(); k++) { player.x += fx * 0.1; player.z += fz * 0.1; }
-  if (solidBox(player.x, player.z, 0, BODY, BODY)) { player.x = px; player.z = pz; }
+  if (solidBox(player.x, player.z, BODY)) { player.x = px; player.z = pz; }
 
   // Last resort. Whatever the geometry does, the pose ends the frame outside the walls.
-  if (solidBox(player.x, player.z, 0, BODY, BODY) || nose() || tail()) {
+  if (solidBox(player.x, player.z, BODY) || nose() || tail()) {
     player.x = safe.x;
     player.z = safe.z;
   } else {
@@ -729,36 +762,96 @@ function drawHunter(h: Hunter.Hunter) {
   }
 }
 
-export function draw() {
-  view(cameraView, cam.x, cam.y, cam.z, cam.yaw, cam.pitch);
-  multiply(vp, proj, cameraView);
+function vrText() {
+  const bar = mid.querySelector('.b')?.textContent;
+  // Locked missions are dimmed on the page; the panel dims the same lines.
+  const dim = Array.from(mid.querySelectorAll('.d'), (e) => e.textContent);
+  const key = [top, mid, low].map((e) => e.innerText).join('\n');
+  if (key === hudKey) return;
+  hudKey = key;
+  tx.clearRect(0, 0, 1024, 640);
+  tx.textAlign = 'center';
+  tx.font = 'bold 34px ui-monospace,Consolas,monospace';
+  let y = 44;
+  for (const l of key.split('\n')) {
+    tx.fillStyle = dim.includes(l) ? '#fff5fb59' : '#fff5fb';
+    if (l && l === bar) { tx.fillStyle = '#ff3fb0'; tx.fillRect(312, y - 33, 400, 44); tx.fillStyle = '#2a0730'; }
+    tx.fillText(l, 512, y);
+    y += 44;
+  }
+  text(tc);
+}
 
-  const bg = drain(0.42, 0.2, 0.5, grey);
-  frame(vp, cam.x, cam.y, cam.z, bg[0], bg[1], bg[2]);
-  setDark(999, 999, 1, grey, cam.x, cam.z);
+const eyeM = mat();
+const roomM = mat();
+export function draw() {
+  const pose = xr.frame && xr.space && xr.frame.getViewerPose(xr.space);
+  const layer = pose && xr.session.renderState.baseLayer;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, pose ? layer.framebuffer : null);
+  clear();
+  if (!pose) {
+    view(cameraView, cam.x, cam.y, cam.z, cam.pitch);
+    multiply(vp, proj, cameraView);
+    setVP(vp, cam.x, cam.y, cam.z);
+    scene(cam.x, cam.z);
+    return;
+  }
+  // Once per eye: the headset's view and projection, behind the room placement that
+  // shrinks the world to a table top. The eye is handed back to the game in tiles.
+  place(roomM, 0, 0.9, xr.z, 0, 0, xr.k);
+  for (const v of pose.views) {
+    const o = layer.getViewport(v);
+    gl.viewport(o.x, o.y, o.width, o.height);
+    multiply(eyeM, v.transform.inverse.matrix, roomM);
+    multiply(vp, v.projectionMatrix, eyeM);
+    const q = v.transform.position;
+    const ex = q.x / xr.k, ey = (q.y - 0.9) / xr.k, ez = (q.z - xr.z) / xr.k;
+    setVP(vp, ex, ey, ez);
+    scene(ex, ez);
+  }
+}
+
+function scene(ex: number, ez: number) {
+  setGrey(grey);
 
   // The sky: a care-bear sky, on purpose. The platform hangs in it, and the whole thing
   // drains along with everything else when the hunters have taken enough. Its pink
   // breathes over a minute and a half — too slow to see happen, enough that it is alive.
   // Drawn first, from a dome that follows the camera so it can never be reached.
   setSky(true, 1, 0.72 + Math.sin(t * 0.07) * 0.05, 0.88);
-  place(tmpM, cam.x, 0, cam.z, 0, 0);
+  place(tmpM, ex, 0, ez, 0, 0);
   drawMesh(skyMesh, tmpM, 0.42, 0.2, 0.52);
   setSky(false);
   // Nine clouds at three distances and four heights, drifting once round the platform
   // in about ten minutes and riding a slow swell: no two missions open on the same sky.
   for (let k = 0; k < 9; k++) {
     const a = (k / 9) * Math.PI * 2 + 0.7 + t * 0.01;
-    const r = 26 + (k % 3) * 9;
+    const r = (26 + (k % 3) * 9) * (xr.session ? 2 : 1); // further out in a headset: they would brush the face
     place(tmpM, Math.cos(a) * r, 5 + (k % 4) * 4.5 + Math.sin(t * 0.3 + k) * 0.6, Math.sin(a) * r, 0, -a, 2.6);
     drawMesh(cloudMesh, tmpM, 1, 0.97, 1);
   }
+
+  // In a headset the page's words hang over the far edge of the platform, tilted to the eye.
+  // Drawn last, over everything, depth test off: they are interface, and they must stay
+  // while a platform is built or taken down, so both exits of this function call this.
+  const words = () => {
+    if (!xr.session) return;
+    vrText();
+    setText(true);
+    setBlend(true);
+    gl.disable(gl.DEPTH_TEST);
+    place(tmpM, 0, 11, -bounds.z - 4, -0.5, 0, 30);
+    drawMesh(textMesh, tmpM, 1, 1, 1);
+    gl.enable(gl.DEPTH_TEST);
+    setBlend(false);
+    setText(false);
+  };
 
   // A platform builds itself tile after tile in the order the plan is written, and is
   // taken down the same way when the mission is over — the VR grid drawing itself in.
   const moving = bootT < 1.9 || downT >= 0;
   const n = scenery.length + 1;
-  const lifted = (p: { mesh: Mesh; model: M4; rgb: [number, number, number] }, k: number) => {
+  const lifted = (p: { mesh: Mesh; model: M4; rgb: [number, number, number] }, k: number, a = 1) => {
     let m = p.model;
     if (moving) {
       const delay = (k / n) * 1.3;
@@ -768,17 +861,18 @@ export function draw() {
       m = tmpM;
       m[13] -= Math.max(1 - up * (2 - up), down * down) * 9;
     }
-    drawMesh(p.mesh, m, p.rgb[0], p.rgb[1], p.rgb[2]);
+    drawMesh(p.mesh, m, p.rgb[0], p.rgb[1], p.rgb[2], 0, a);
   };
-  scenery.forEach(lifted);
+  scenery.forEach((p, i) => lifted(p, i));
   // Nothing stands on a platform that is not there yet: what lives on the floor waits for
   // the last tile, and goes when the first one sinks.
   const built = bootT >= 1.9 && downT < 0;
   if (!built) {
     setBlend(true);
-    for (const p of roofs) lifted(p, n - 1);
+    for (const p of roofs) lifted(p, n - 1, 0.55);
     setBlend(false);
     if (phase === 'title' || phase === 'menu') arch(0, -16, -0.3, 0.85, false);
+    words();
     return;
   }
 
@@ -865,7 +959,7 @@ export function draw() {
   // The hedge roofs last and see-through: the unicorn shows under them to the player,
   // while to the hunters what is under a hedge does not exist.
   setBlend(true);
-  for (const p of roofs) lifted(p, n - 1);
+  for (const p of roofs) lifted(p, n - 1, 0.55);
   setBlend(false);
 
   // The ending: an arch the horn draws over the platform, opening over three seconds,
@@ -878,4 +972,5 @@ export function draw() {
   // The title's rainbow stands behind the far edge of the platform, the one time the
   // camera is low enough to see a whole one.
   if (phase === 'title' || phase === 'menu') arch(0, -16, -0.3, 0.85, false); // fixed: the camera looks at the origin here
+  words();
 }

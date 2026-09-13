@@ -5,7 +5,7 @@
 import { canvas } from './view';
 import type { M4 } from './mat';
 
-export const gl = canvas.getContext('webgl2', { antialias: true, alpha: false })!;
+export const gl = canvas.getContext('webgl2', { alpha: false })!;
 
 const VERT = `#version 300 es
 in vec3 p;
@@ -14,12 +14,12 @@ uniform mat4 uV;
 uniform mat4 uM;
 out vec3 vN;
 out vec3 vP;
-out float vL;
+out vec2 vU;
 void main(){
   vec4 w = uM * vec4(p, 1.);
   vP = w.xyz;
+  vU = p.xy;
   vN = mat3(uM) * n;
-  vL = p.y;
   gl_Position = uV * w;
 }`;
 
@@ -27,8 +27,6 @@ void main(){
 // contents of a string literal, so a comment written in GLSL ships in the zip.
 //
 //   uB  x = how many colour bands the horn carries, y = 1 / its length
-//   uD  xy = where the dark stands, z = how far its reach extends
-//   uT    the world position to test for the viewmodel, which has none of its own
 //   uG  permanent desaturation: what every past failure has cost for good
 //
 // The banded branch stacks discrete colours along the horn, base to tip, never a
@@ -46,20 +44,16 @@ void main(){
 // ending on a hard dark edge. The fog colour is the clear colour before the drain, which
 // is applied after it, so a fogged side greys out with the rest.
 //
-// The dark itself is never drawn. It is only the last three lines: colour leaving the
-// world around a point, which is what tells the player where it stands without a single
-// marker on screen.
 const FRAG = `#version 300 es
 precision highp float;
 in vec3 vN;
 in vec3 vP;
-in float vL;
+in vec2 vU;
+uniform sampler2D uX;
 uniform vec3 uE;
 uniform vec3 uC;
 uniform float uI;
 uniform vec2 uB;
-uniform vec3 uD;
-uniform vec2 uT;
 uniform float uG;
 uniform float uA;
 uniform float uF;
@@ -73,17 +67,14 @@ vec3 hsv(float h, float s, float v){
 }
 
 void main(){
+  if (uK > 1.5) {
+    vec4 t = texture(uX, vec2(vU.x + .5, .5 - vU.y * 1.6));
+    o = vec4(mix(t.rgb, vec3(dot(t.rgb, vec3(.3, .59, .11))), uG), t.a);
+    return;
+  }
   if (uK > .5) {
     vec3 d = normalize(vP - vec3(uE.x, 0., uE.z));
     vec3 s = mix(uC, uS, clamp(d.y * 1.2 + .44, 0., 1.));
-    // The arch is centred on a raised axis and only drawn well above the horizon: the
-    // platform floats, so anything near eye level shows up in the gap around it and
-    // reads as passing in front of the level.
-    float a = acos(clamp(dot(d, normalize(vec3(0., .62, -1.))), -1., 1.));
-    float band = (a - .46) / .3;
-    if (band > 0. && band < 1.) {
-      s = mix(s, hsv(band * .82, .8, 1.), .7 * smoothstep(.16, .34, d.y));
-    }
     o = vec4(mix(s, vec3(dot(s, vec3(.3, .59, .11))), uG), 1.);
     return;
   }
@@ -93,7 +84,7 @@ void main(){
   vec3 c = uC * (mix(vec3(.5, .3, .45), vec3(.62, .58, .52), n.y * .5 + .5) + .5 * d);
 
   if (uI > .5) {
-    float t = clamp(vL * uB.y, 0., .999);
+    float t = clamp(vU.y * uB.y, 0., .999);
     float hue = floor(t * uB.x) / uB.x * .82;
     float sheen = 1. - abs(dot(n, v));
     c = hsv(hue, .95, .5 + .3 * d + .25 * sheen);
@@ -101,11 +92,9 @@ void main(){
 
   c = mix(c, vec3(.42, .2, .5), clamp(-vP.y * 1.2, 0., 1.) * .7);
 
-  vec2 wp = uI > .5 ? uT : vP.xz;
-  float g = max(uG, 1. - smoothstep(uD.z * .3, uD.z, distance(wp, uD.xy)));
-  c = mix(c, vec3(dot(c, vec3(.3, .59, .11))), g);
+  c = mix(c, vec3(dot(c, vec3(.3, .59, .11))), uG);
 
-  o = vec4(c, uA * (uF > 0. ? clamp(vL / uF, 0., 1.) : 1.));
+  o = vec4(c, uA * (uF > 0. ? clamp(vU.y / uF, 0., 1.) : 1.));
 }`;
 
 function shader(type: number, src: string) {
@@ -127,8 +116,6 @@ const uE = gl.getUniformLocation(program, 'uE');
 const uC = gl.getUniformLocation(program, 'uC');
 const uI = gl.getUniformLocation(program, 'uI');
 const uB = gl.getUniformLocation(program, 'uB');
-const uD = gl.getUniformLocation(program, 'uD');
-const uT = gl.getUniformLocation(program, 'uT');
 const uG = gl.getUniformLocation(program, 'uG');
 const uA = gl.getUniformLocation(program, 'uA');
 const uF = gl.getUniformLocation(program, 'uF');
@@ -139,6 +126,21 @@ const uK = gl.getUniformLocation(program, 'uK');
 export function setSky(on: boolean, r = 0, g = 0, b = 0) {
   gl.uniform1f(uK, on ? 1 : 0);
   if (on) gl.uniform3f(uS, r, g, b);
+}
+
+// The one texture: the page's text, drawn into a canvas, for the headset where the page
+// itself cannot be seen. A panel of 1 by 0.625 maps it edge to edge (see the shader).
+gl.bindTexture(gl.TEXTURE_2D, gl.createTexture());
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+// One transparent texel from the start, with real data: a sampler bound to an empty
+// texture makes Firefox warn on every draw, and a null upload makes it warn once about
+// "lazy initialization" instead.
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(4));
+export function text(c: HTMLCanvasElement) {
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, c);
+}
+export function setText(on: boolean) {
+  gl.uniform1f(uK, on ? 2 : 0);
 }
 
 gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
@@ -162,10 +164,8 @@ export function setBands(count: number, length: number) {
   gl.uniform2f(uB, count, 1 / length);
 }
 
-/** Where the dark stands and how far it reaches, plus the colour it has taken for good. */
-export function setDark(x: number, z: number, reach: number, grey: number, atX: number, atZ: number) {
-  gl.uniform3f(uD, x, z, reach);
-  gl.uniform2f(uT, atX, atZ);
+/** The colour the world has lost for good. */
+export function setGrey(grey: number) {
   gl.uniform1f(uG, grey);
 }
 
@@ -211,10 +211,11 @@ export function setVP(vp: M4, ex: number, ey: number, ez: number) {
  * The sky is the clear colour: outdoors it fills half the screen, so it is set from the
  * game rather than fixed here — it has to drain along with everything else.
  */
-export function frame(vp: M4, ex: number, ey: number, ez: number, r: number, g: number, b: number) {
-  gl.clearColor(r, g, b, 1);
+// The sky dome covers every pixel in every phase, so the clear colour is never seen; it
+// is set once, to the sky's own purple, as a fallback that nobody should ever meet.
+gl.clearColor(0.42, 0.2, 0.5, 1);
+export function clear() {
   gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-  setVP(vp, ex, ey, ez);
 }
 
 export function draw(m: Mesh, model: M4, r: number, g: number, b: number, irid = 0, alpha = 1) {
